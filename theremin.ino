@@ -2,13 +2,14 @@
 
 //HOW IT SOUNDS
 const float glissando = 20000;  // how long it takes to track to a note; smaller numbers track faster or set to 0 for instant 
-const float vibrato_depth = 0.1;  // how much vibrato on each note; smaller numbers are less vibrato
-const float vibrato_rate = 0.001;  // how quickly the vibrato vibratoes; smaller numbers are slower
+const float vibrato_depth = 0.02;  // how much vibrato on each note; smaller numbers are less vibrato
+const float vibrato_rate = 0.08;  // how quickly the vibrato vibratoes; smaller numbers are slower
 
 //INTERNAL STUFF
 int out_pin = 8;
 float last_pitch = 0;
 float pitch = 0;
+float pitch_vibrato = 0;
 float target_pitch = 0;
 const int num_pitches = sizeof(pitches) / sizeof(float);
 const int num_octaves = 2;
@@ -20,6 +21,7 @@ float key_pitches[num_pitches];
 int range = 0;
 int timer;  // used for keeping track of where we are in the vibrato
 int sensor_input;
+double last_xd;
 
 //converts a potentiometer signal into a more linear signal
 int pot_to_lin(int x)
@@ -39,18 +41,34 @@ int pot_to_lin(int x)
 //note: xmin and xmax can be adjusted to change how physically far the highest and lowest note are from each other 
 int ir_to_lin(int x)
 {
-  const double xcutoff = 2.0;  // value below which no notes will play
-  const double xmin = 3.0;  // value below which the lowest note will play by default
-  const double xmax = 10.0;  // value above which the highest note will play by default
+  const double xcutoff = 14.0;  // value above which no notes will play
+  const double xmin = 2.0;  // value below which the lowest note will play by default
+  const double xmax = 9.0;  // value above which the highest note will play by default
 
   double xd = 1023.0 / x;
 
-  if (xd < xcutoff)
-    return -1;  // return a negative value if the sensor value is below the cutoff
+  //Serial.print(xd);
+  //Serial.print(" - ");
+
+  if (xd > xcutoff)
+    xd = -1;  // return a negative value if the sensor value is below the cutoff
   else if (xd > xmax)
     xd = xmax;
   else if (xd < xmin)
     xd = xmin;
+
+  //Serial.println(xd);
+
+  if (xd < 0 || last_xd < 0)
+  {
+    //Serial.println("No output");
+    last_xd = xd;
+    return -1;
+  }
+
+  //Serial.println("Output!");
+  //Serial.println(xd);
+  last_xd = xd;
 
   double xnorm = 1.0 - (xd - xmin) / (xmax - xmin);  
   return xnorm * 1024.0;
@@ -140,10 +158,12 @@ void loop() {
 
   if (vibrato_depth > 0)  // add a bit of a sine wave to do vibrato if enabled
   {
-    pitch += pitch * vibrato_depth * sin(timer * vibrato_rate);
+    pitch_vibrato = pitch * (1 + vibrato_depth * sin(timer * vibrato_rate));
   }
+  else
+    pitch_vibrato = pitch;
 
-  tone(out_pin, pitch, 50);  // maps sensor input
+  tone(out_pin, pitch_vibrato, 50);  // maps sensor input
   last_pitch = pitch;
   ++timer; // increment vibrato timer
 }
