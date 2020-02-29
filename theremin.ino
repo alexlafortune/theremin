@@ -1,32 +1,53 @@
-#include "pitches.h"
-
 //HOW IT SOUNDS
-const float glissando = 20000;  // how long it takes to track to a note; smaller numbers track faster or set to 0 for instant 
-const float vibrato_depth = 0.02;  // how much vibrato on each note; smaller numbers are less vibrato
+const float glissando = 0;  // how long it takes to track to a note; smaller numbers track faster or set to 0 for instant
+const float vibrato_depth = 0;  // how much vibrato on each note; smaller numbers are less vibrato
 const float vibrato_rate = 0.08;  // how quickly the vibrato vibratoes; smaller numbers are slower
 
 //INTERNAL STUFF
-int out_pin = 8;
-float last_pitch = 0;
-float pitch = 0;
-float pitch_vibrato = 0;
-float target_pitch = 0;
-const int num_pitches = sizeof(pitches) / sizeof(float);
+int last_note = 0;
+int note = 0;
 const int num_octaves = 2;
-int key_index = 0;
+const int num_notes = 12 * num_octaves + 1;
+int notes[num_notes];
+int notes_in_key = 0;  // how many notes fit in the range of the sensor
+int key_offset = 0;
 int key_type = 0;
-int last_key_index = -1;
-int last_key_type = -1;
-float key_pitches[num_pitches];
-int range = 0;
 int timer;  // used for keeping track of where we are in the vibrato
 int sensor_input;
 double last_xd;
+const int note_lpf_buffer_size = 128;
+int note_lpf_buffer[note_lpf_buffer_size];
+const int keytype_lpf_buffer_size = 64;
+int keytype_lpf_buffer[keytype_lpf_buffer_size];
+const int keyoffset_lpf_buffer_size = 64;
+int keyoffset_lpf_buffer[keyoffset_lpf_buffer_size];
+
+int get_lpf_output(int *lpf_buffer, int lpf_buffer_size, int input)
+{
+  long sum = 0;
+  
+  for (int i = 0; i < lpf_buffer_size - 1; ++i)
+  {
+    lpf_buffer[i] = lpf_buffer[i + 1];
+    sum += lpf_buffer[i];
+  }
+
+  lpf_buffer[lpf_buffer_size - 1] = input;
+  sum += input;
+  
+  return sum / lpf_buffer_size;
+}
+
+void clear_lpf(int *lpf_buffer, int lpf_buffer_size)
+{
+  for (int i = 0; i < lpf_buffer_size; ++i)
+    lpf_buffer[i] = 0;
+}
 
 //converts a potentiometer signal into a more linear signal
 int pot_to_lin(int x)
 {
-  const double x0 = 148;  //  the slope changes about halfway through pot's rotation 
+  const double x0 = 148;  //  the slope changes about halfway through pot's rotation
   const double y0 = 512;  // pot value where the slope changes
   const double m = (1024 - y0) / (1024 - x0);
   const double b = y0 - m * x0;  // y-intercept of second sloped section
@@ -38,7 +59,7 @@ int pot_to_lin(int x)
 }
 
 //converts the IR distance sensor signal into a more linear signal
-//note: xmin and xmax can be adjusted to change how physically far the highest and lowest note are from each other 
+//note: xmin and xmax can be adjusted to change how physically far the highest and lowest note are from each other
 int ir_to_lin(int x)
 {
   const double xcutoff = 14.0;  // value above which no notes will play
@@ -70,100 +91,130 @@ int ir_to_lin(int x)
   //Serial.println(xd);
   last_xd = xd;
 
-  double xnorm = 1.0 - (xd - xmin) / (xmax - xmin);  
+  double xnorm = 1.0 - (xd - xmin) / (xmax - xmin);
   return xnorm * 1024.0;
 }
 
-//takes a float and returns the nearest index of the pitches array
-int snap(float pitch)
+//resets the array of notees to choose from based on key type (maj, min, chr) and offset (in semitones) from A
+void set_key(int type, int offset)
 {
-  for (int i = 0; i < num_pitches; ++i)
-    if (pitches[i] >= pitch)
-      return i;
-}
-
-//resets the array of pitches to choose from based on key type (maj, min, chr) and offset (in semitones) from A
-void set_key(int key_type, int offset)
-{  
   int major[7] = {2, 2, 1, 2, 2, 2, 1};
   int minor[7] = {2, 1, 2, 2, 1, 2, 2};
   int chromatic[7] = {1, 1, 1, 1, 1, 1, 1};
   int *key_steps;
-  
-  if (key_type == 0)
+
+  if (type == 0)
   {
     key_steps = major;
-    range = num_octaves * 7;
+    notes_in_key = 7 * num_octaves;
   }
-  else if (key_type == 1)
+  else if (type == 1)
   {
     key_steps = minor;
-    range = num_octaves * 7;
+    notes_in_key = 7 * num_octaves;
   }
   else
   {
     key_steps = chromatic;
-    range = num_octaves * 12;
+    notes_in_key = 12 * num_octaves;
   }
 
-  for (int i = offset, j = 0; i < num_pitches; ++j)
+  note = 50 + offset;  //start 50 notes up from the minimum MIDI note
+  
+  for (int i = 0; i < num_notes; ++i)
   {
-    key_pitches[j] = pitches[i];
-    i += key_steps[j % 7];
+    note += key_steps[i % 7];
+    notes[i] = note;
+    //Serial.print(note);
+    //Serial.print(", ");
   }
+
+  key_type = type;
+  key_offset = offset;
 }
 
 //converts the input of a pin (0-1024) to a defined range (e.g. 0-7)
-int input(int pin, int range)
+int normalize(int x, int range)
 {
-  return int(range * pot_to_lin(analogRead(pin)) / 1024.0);
+  return int(range * x / 1024.0);
+}
+
+// plays a MIDI note. Doesn't check to see that cmd is greater than 127, or that
+// data values are less than 127:
+void send_midi(int cmd, int note, int velocity)
+{
+  /*Serial.print("Sending command: ");
+  Serial.print(cmd);
+  Serial.print(" ");
+  Serial.print(note);
+  Serial.print(" ");
+  Serial.println(velocity);*/
+
+  Serial.write(cmd);
+  Serial.write(note);
+  Serial.write(velocity);
+}
+
+//turns off all notes on all channels
+void midi_kill()
+{
+  send_midi(176, 123, 0);
 }
 
 //needs to run at the start
 void setup() {
-  pinMode(out_pin, OUTPUT);
-  Serial.begin(4800);
+  for (int i = 0; i < note_lpf_buffer_size; ++i)
+    note_lpf_buffer[i] = 0;
+    
+  //Serial.begin(4800);
+  Serial.begin(31250);
   set_key(0, 0);
   timer = 0;
+
+  Serial.write(192);  // status byte for channel 0
+  Serial.write(0);  // set instrument to 0
 }
 
-//the program loop itself
-void loop() {
-  key_index = input(A1, 12);
-  key_type = input(A2, 3);
+//the program loop
+void loop() {  
+  int input_key_type = normalize(
+    get_lpf_output(keytype_lpf_buffer, keytype_lpf_buffer_size, pot_to_lin(analogRead(A2))), 
+    3
+  );
   
-  if (last_key_index != key_index || last_key_type != key_type)
-    set_key(key_type, key_index);  // semitones to shift up through pitches array
+  int input_key_offset = normalize(
+    get_lpf_output(keyoffset_lpf_buffer, keyoffset_lpf_buffer_size, pot_to_lin(analogRead(A1))), 
+    12
+  );
+
+  if (input_key_type != key_type || input_key_offset != key_offset)
+  {      
+    set_key(input_key_type, input_key_offset);  // number of notes to shift up through notes array
+    /*Serial.print("New key: ");
+    Serial.print(key_type);
+    Serial.print(", ");
+    Serial.print(key_offset);
+    Serial.println();*/
+  }
 
   sensor_input = ir_to_lin(analogRead(A0));
 
   if (sensor_input == -1)  // if sensor value is below the cutoff
-    return;  // play no notes, do not pass go, do not collect $200
-  
-  int index = range * sensor_input / 1024.0 + 0.5;
-  target_pitch = key_pitches[index];  
-  // round to nearest index, not just round down, which gives access to notes 0 thru 11 plus the octave, 12
-
-  if (glissando == 0 || last_pitch == 0)  // don't bother doing math if glissando is zero
-  {
-    pitch = target_pitch;
-  }
-  else
-  {
-    if (target_pitch > last_pitch)  // adjust the pitch based on how far we are from the last pitch
-      pitch = last_pitch * (1 + abs(target_pitch - last_pitch) / glissando);
-    else
-      pitch = last_pitch / (1 + abs(target_pitch - last_pitch) / glissando);
+  {      
+    midi_kill();
+    clear_lpf(note_lpf_buffer, note_lpf_buffer_size);
+    return;  // kill all midi notes, clear lpf buffer, do not pass go, do not collect $200
   }
 
-  if (vibrato_depth > 0)  // add a bit of a sine wave to do vibrato if enabled
-  {
-    pitch_vibrato = pitch * (1 + vibrato_depth * sin(timer * vibrato_rate));
-  }
-  else
-    pitch_vibrato = pitch;
+  int index = notes_in_key * get_lpf_output(note_lpf_buffer, note_lpf_buffer_size, sensor_input) / 1024.0 + 0.5;
+  note = notes[index];
 
-  tone(out_pin, pitch_vibrato, 50);  // maps sensor input
-  last_pitch = pitch;
-  ++timer; // increment vibrato timer
+  if (note != last_note)
+  {
+    midi_kill();
+    send_midi(144, note, 127);
+    //Serial.println(note);
+  }
+
+  last_note = note;
 }
